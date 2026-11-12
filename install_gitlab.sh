@@ -3,6 +3,46 @@ set -euo pipefail
 
 # GitLab CE installer for Ubuntu 22.04 (jammy)
 # Supports: IP-only setup OR domain + HTTPS (Let's Encrypt)
+#
+# Settings are read from .env (next to this script) or from the file in $ENV_FILE.
+# Anything missing is asked interactively.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+is_yes() { [[ "${1,,}" =~ ^(y|yes|true|1)$ ]]; }
+
+load_env() {
+  if [[ -f "${ENV_FILE}" ]]; then
+    echo ">> Loading settings from ${ENV_FILE}"
+    # Variables already exported in the environment win over .env
+    local saved
+    saved="$(export -p | sed "s/^declare -x /declare -gx /")"
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    set +a
+    eval "${saved}"
+  fi
+}
+
+# ask VAR "Prompt" [default] — prompts only if VAR is empty
+ask() {
+  local var="$1" prompt="$2" def="${3:-}" val="${!1:-}"
+  if [[ -z "${val}" && -t 0 ]]; then
+    read -rp "${prompt}${def:+ [${def}]}: " val
+  fi
+  printf -v "${var}" '%s' "${val:-${def}}"
+}
+
+confirm() {
+  is_yes "${ASSUME_YES:-no}" && return 0
+  [[ -t 0 ]] || die "Non-interactive run: set ASSUME_YES=yes to continue."
+  local ans
+  read -rp "$1 [y/N]: " ans
+  is_yes "${ans}"
+}
 
 require_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -13,70 +53,62 @@ require_root() {
 
 prompt_inputs() {
   echo "=== GitLab CE Installer ==="
-  read -rp "Enter SERVER PUBLIC IP (e.g., 31.184.130.229): " SERVER_IP
-  [[ -n "${SERVER_IP:-}" ]] || { echo "IP is required."; exit 1; }
+  ask SERVER_IP "Enter SERVER PUBLIC IP (e.g., 31.184.130.229)"
+  [[ -n "${SERVER_IP}" ]] || die "SERVER_IP is required."
 
-  read -rp "Do you already have a real domain to use? (y/N): " HAVE_DOMAIN
-  HAVE_DOMAIN="${HAVE_DOMAIN,,}"
-  if [[ "${HAVE_DOMAIN}" == "y" || "${HAVE_DOMAIN}" == "yes" ]]; then
-    read -rp "Enter domain/hostname (e.g., gitlab.example.com): " HOSTNAME
-    [[ -n "${HOSTNAME:-}" ]] || { echo "Hostname is required when using a domain."; exit 1; }
+  local default_url
+  ask USE_DOMAIN "Do you already have a real domain to use? (y/N)" "no"
+  if is_yes "${USE_DOMAIN}"; then
+    USE_DOMAIN="yes"
+    ask GITLAB_HOSTNAME "Enter domain/hostname (e.g., gitlab.example.com)"
+    [[ -n "${GITLAB_HOSTNAME}" ]] || die "GITLAB_HOSTNAME is required when using a domain."
 
-    echo "Choose protocol for external_url:"
-    echo "  [1] HTTPS with Let's Encrypt (recommended)"
-    echo "  [2] HTTP (no SSL for now)"
-    read -rp "Choose 1 or 2 [default 1]: " PROTO_CHOICE
-    PROTO_CHOICE="${PROTO_CHOICE:-1}"
-
-    if [[ "${PROTO_CHOICE}" == "2" ]]; then
-      USE_LETSENCRYPT="no"
-      EXTERNAL_URL="http://${HOSTNAME}"
-    else
+    ask USE_LETSENCRYPT "Enable HTTPS with Let's Encrypt? (Y/n)" "yes"
+    if is_yes "${USE_LETSENCRYPT}"; then
       USE_LETSENCRYPT="yes"
-      EXTERNAL_URL="https://${HOSTNAME}"
-      read -rp "Contact email for Let's Encrypt (e.g., you@example.com): " LE_EMAIL
-      [[ -n "${LE_EMAIL:-}" ]] || { echo "Email is required for Let's Encrypt."; exit 1; }
+      default_url="https://${GITLAB_HOSTNAME}"
+      ask LE_EMAIL "Contact email for Let's Encrypt (e.g., you@example.com)"
+      [[ -n "${LE_EMAIL}" ]] || die "LE_EMAIL is required for Let's Encrypt."
+    else
+      USE_LETSENCRYPT="no"
+      default_url="http://${GITLAB_HOSTNAME}"
     fi
   else
     # IP-only mode (or local hostname)
-    read -rp "Enter a local hostname (default: gitlab.local): " HOSTNAME
-    HOSTNAME="${HOSTNAME:-gitlab.local}"
+    USE_DOMAIN="no"
     USE_LETSENCRYPT="no"
-    # Choose to expose via IP or hostname
-    echo "Use EXTERNAL_URL as:"
-    echo "  [1] http://${SERVER_IP}    (via IP)"
-    echo "  [2] http://${HOSTNAME}     (via local hostname)"
-    read -rp "Choose 1 or 2 [default 1]: " CHOICE
-    CHOICE="${CHOICE:-1}"
-    if [[ "${CHOICE}" == "2" ]]; then
-      EXTERNAL_URL="http://${HOSTNAME}"
+    ask GITLAB_HOSTNAME "Enter a local hostname" "gitlab.local"
+    ask ACCESS_VIA "Expose GitLab via 'ip' (http://${SERVER_IP}) or 'hostname' (http://${GITLAB_HOSTNAME})" "ip"
+    if [[ "${ACCESS_VIA,,}" == "hostname" ]]; then
+      default_url="http://${GITLAB_HOSTNAME}"
     else
-      EXTERNAL_URL="http://${SERVER_IP}"
+      default_url="http://${SERVER_IP}"
     fi
   fi
+  EXTERNAL_URL="${EXTERNAL_URL:-${default_url}}"
 
   echo
   echo "Summary:"
   echo "  SERVER_IP       = ${SERVER_IP}"
-  echo "  HOSTNAME        = ${HOSTNAME}"
+  echo "  GITLAB_HOSTNAME = ${GITLAB_HOSTNAME}"
   echo "  EXTERNAL_URL    = ${EXTERNAL_URL}"
   echo "  LETS_ENCRYPT    = ${USE_LETSENCRYPT}"
   [[ "${USE_LETSENCRYPT}" == "yes" ]] && echo "  LE_EMAIL        = ${LE_EMAIL}"
+  echo "  CREATE_BACKUP   = ${CREATE_BACKUP:-yes}"
+  echo "  INSTALL_RUNNER  = ${INSTALL_RUNNER:-no}"
   echo
-  read -rp "Proceed with these settings? [y/N]: " CONFIRM
-  [[ "${CONFIRM,,}" == "y" ]] || { echo "Aborted."; exit 1; }
+  confirm "Proceed with these settings?" || { echo "Aborted."; exit 1; }
 }
 
 prep_network() {
   # Optional sanity check: does hostname resolve to the server IP (if using domain)?
-  if [[ "${USE_LETSENCRYPT}" == "yes" || "${EXTERNAL_URL}" == http*://${HOSTNAME}* ]]; then
+  if [[ "${USE_LETSENCRYPT}" == "yes" || "${EXTERNAL_URL}" == http*://${GITLAB_HOSTNAME}* ]]; then
     if command -v getent >/dev/null 2>&1; then
-      RESOLVED_IP="$(getent hosts "${HOSTNAME}" | awk '{print $1}' | head -n1 || true)"
+      RESOLVED_IP="$(getent hosts "${GITLAB_HOSTNAME}" | awk '{print $1}' | head -n1 || true)"
       if [[ -n "${RESOLVED_IP}" && "${RESOLVED_IP}" != "${SERVER_IP}" ]]; then
-        echo "WARNING: ${HOSTNAME} resolves to ${RESOLVED_IP}, not ${SERVER_IP}."
+        echo "WARNING: ${GITLAB_HOSTNAME} resolves to ${RESOLVED_IP}, not ${SERVER_IP}."
         echo "Let's Encrypt requires the domain to resolve to this server."
-        read -rp "Continue anyway? (y/N): " go
-        [[ "${go,,}" == "y" ]] || exit 1
+        confirm "Continue anyway?" || exit 1
       fi
     fi
   fi
@@ -90,13 +122,13 @@ prep_network() {
 }
 
 setup_hostname_and_hosts() {
-  echo ">> Setting system hostname to '${HOSTNAME}' ..."
-  hostnamectl set-hostname "${HOSTNAME}"
+  echo ">> Setting system hostname to '${GITLAB_HOSTNAME}' ..."
+  hostnamectl set-hostname "${GITLAB_HOSTNAME}"
 
   # Ensure /etc/hosts maps server IP to hostname (helps local resolution)
-  if ! grep -Eq "^\s*${SERVER_IP}\s+.*\b${HOSTNAME}\b" /etc/hosts; then
-    echo ">> Adding '${SERVER_IP} ${HOSTNAME} gitlab' to /etc/hosts"
-    echo "${SERVER_IP} ${HOSTNAME} gitlab" >> /etc/hosts
+  if ! grep -Eq "^\s*${SERVER_IP}\s+.*\b${GITLAB_HOSTNAME}\b" /etc/hosts; then
+    echo ">> Adding '${SERVER_IP} ${GITLAB_HOSTNAME} gitlab' to /etc/hosts"
+    echo "${SERVER_IP} ${GITLAB_HOSTNAME} gitlab" >> /etc/hosts
   fi
 }
 
@@ -157,9 +189,23 @@ configure_gitlab() {
 }
 
 create_backup() {
+  is_yes "${CREATE_BACKUP:-yes}" || return 0
   echo ">> Creating initial backup ..."
   gitlab-rake gitlab:backup:create
   echo "Backup location: /var/opt/gitlab/backups/"
+}
+
+install_runner() {
+  is_yes "${INSTALL_RUNNER:-no}" || return 0
+  echo ">> Installing GitLab Runner on this server ..."
+  local extra_hosts="${RUNNER_DOCKER_EXTRA_HOSTS:-}"
+  # Job containers can't see this server's /etc/hosts; give them the local hostname mapping.
+  if [[ -z "${extra_hosts}" && "${USE_DOMAIN}" != "yes" ]]; then
+    extra_hosts="${GITLAB_HOSTNAME}:${SERVER_IP}"
+  fi
+  GITLAB_URL="${GITLAB_URL:-${EXTERNAL_URL}}" \
+  RUNNER_DOCKER_EXTRA_HOSTS="${extra_hosts}" \
+    bash "${SCRIPT_DIR}/install_gitlab_runner.sh"
 }
 
 post_notes() {
@@ -171,7 +217,7 @@ post_notes() {
   echo
   echo "If you used a local hostname and want to access from your laptop,"
   echo "add to your local hosts file:"
-  echo "   ${SERVER_IP} ${HOSTNAME}"
+  echo "   ${SERVER_IP} ${GITLAB_HOSTNAME}"
   echo
   echo "To switch later to a real domain + HTTPS:"
   echo "  1) Point DNS: gitlab.yourdomain.tld -> ${SERVER_IP}"
@@ -180,11 +226,15 @@ post_notes() {
   echo "       letsencrypt['enable'] = true"
   echo "       letsencrypt['contact_emails'] = ['you@example.com']"
   echo "  3) Run: gitlab-ctl reconfigure"
+  echo
+  echo "To add a GitLab Runner (here or on another server):"
+  echo "  sudo bash install_gitlab_runner.sh"
   echo "=============================================================="
 }
 
 main() {
   require_root
+  load_env
   prompt_inputs
   prep_network
   setup_hostname_and_hosts
@@ -193,6 +243,7 @@ main() {
   install_gitlab
   configure_gitlab
   create_backup
+  install_runner
   post_notes
 }
 
